@@ -18,8 +18,13 @@ package org.springframework.web.accept;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -43,8 +48,9 @@ import org.springframework.web.context.request.NativeWebRequest;
  * <p>The method {@link #handleNoMatch} allow subclasses to plug in additional
  * ways of looking up media types (for example, through the Java Activation framework,
  * or {@link jakarta.servlet.ServletContext#getMimeType}). Media types resolved
- * via base classes are then added to the base class
- * {@link MappingMediaTypeFileExtensionResolver}, i.e. cached for new lookups.
+ * this way are not added to the base class {@link MappingMediaTypeFileExtensionResolver}.
+ * The file extension resolved this way is still remembered, within a fixed
+ * bound, for reverse lookups through {@link #resolveFileExtensions(MediaType)}.
  *
  * @author Rossen Stoyanchev
  * @since 3.2
@@ -52,11 +58,24 @@ import org.springframework.web.context.request.NativeWebRequest;
 public abstract class AbstractMappingContentNegotiationStrategy extends MappingMediaTypeFileExtensionResolver
 		implements ContentNegotiationStrategy {
 
+	/**
+	 * Maximum number of file extensions resolved via {@link #handleNoMatch}
+	 * that are remembered for reverse lookups.
+	 */
+	private static final int MAX_RESOLVED_FILE_EXTENSIONS = 256;
+
+
 	protected final Log logger = LogFactory.getLog(getClass());
 
 	private boolean useRegisteredExtensionsOnly = false;
 
 	private boolean ignoreUnknownExtensions = false;
+
+	/** Reverse lookup for file extensions resolved via {@link #handleNoMatch}. */
+	private final ConcurrentMap<MediaType, CopyOnWriteArrayList<String>> resolvedFileExtensions =
+			new ConcurrentHashMap<>();
+
+	private final AtomicInteger resolvedFileExtensionCount = new AtomicInteger();
 
 
 	/**
@@ -118,11 +137,26 @@ public abstract class AbstractMappingContentNegotiationStrategy extends MappingM
 			}
 			mediaType = handleNoMatch(webRequest, key);
 			if (mediaType != null) {
-				addMapping(key, mediaType);
+				addResolvedFileExtension(key, mediaType);
 				return Collections.singletonList(mediaType);
 			}
 		}
 		return MEDIA_TYPE_ALL_LIST;
+	}
+
+	/**
+	 * Resolve the given media type to file extensions from the registered
+	 * mappings, falling back on file extensions previously resolved via
+	 * {@link #handleNoMatch}.
+	 */
+	@Override
+	public List<String> resolveFileExtensions(MediaType mediaType) {
+		List<String> fileExtensions = super.resolveFileExtensions(mediaType);
+		if (!fileExtensions.isEmpty()) {
+			return fileExtensions;
+		}
+		List<String> resolved = this.resolvedFileExtensions.get(mediaType.removeQualityValue());
+		return (resolved != null ? Collections.unmodifiableList(resolved) : Collections.emptyList());
 	}
 
 
@@ -143,8 +177,10 @@ public abstract class AbstractMappingContentNegotiationStrategy extends MappingM
 	/**
 	 * Override to provide handling when a key is not resolved via.
 	 * {@link #lookupMediaType}. Subclasses can take further steps to
-	 * determine the media type(s). If a MediaType is returned from
-	 * this method it will be added to the cache in the base class.
+	 * determine the media type(s). A MediaType returned from this method
+	 * is not added to the registered mappings in the base class, but the
+	 * file extension is remembered, within a fixed bound, for reverse
+	 * lookups through {@link #resolveFileExtensions(MediaType)}.
 	 */
 	@Nullable
 	protected MediaType handleNoMatch(NativeWebRequest request, String key)
@@ -160,6 +196,33 @@ public abstract class AbstractMappingContentNegotiationStrategy extends MappingM
 			return null;
 		}
 		throw new HttpMediaTypeNotAcceptableException(getAllMediaTypes());
+	}
+
+	/**
+	 * Remember a file extension resolved via {@link #handleNoMatch} for reverse
+	 * lookups, without adding it to the registered mappings. Keys containing a
+	 * '.' are ignored, and the total number of remembered extensions is bounded.
+	 */
+	private void addResolvedFileExtension(String key, MediaType mediaType) {
+		if (key.indexOf('.') != -1) {
+			return;
+		}
+		String extension = key.toLowerCase(Locale.ROOT);
+		MediaType mediaTypeKey = mediaType.removeQualityValue();
+		List<String> extensions = this.resolvedFileExtensions.get(mediaTypeKey);
+		if (extensions != null && extensions.contains(extension)) {
+			return;
+		}
+		if (this.resolvedFileExtensionCount.incrementAndGet() > MAX_RESOLVED_FILE_EXTENSIONS) {
+			this.resolvedFileExtensionCount.decrementAndGet();
+			return;
+		}
+		boolean added = this.resolvedFileExtensions
+				.computeIfAbsent(mediaTypeKey, type -> new CopyOnWriteArrayList<>())
+				.addIfAbsent(extension);
+		if (!added) {
+			this.resolvedFileExtensionCount.decrementAndGet();
+		}
 	}
 
 }
