@@ -19,6 +19,11 @@ package org.springframework.web.server.session;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.Test;
@@ -196,6 +201,96 @@ class InMemoryWebSessionStoreTests {
 		assertNumSessions(10);
 	}
 
+	@Test
+	void changeSessionIdRemovesOldId() {
+		WebSession session = insertSession();
+		String oldId = session.getId();
+
+		session.changeSessionId().block();
+		String newId = session.getId();
+		assertThat(newId).isNotEqualTo(oldId);
+
+		// Saving after the id change must not bring the old id back
+		session.save().block();
+
+		assertThat(this.store.getSessions()).containsOnlyKeys(newId);
+		assertThat(this.store.retrieveSession(oldId).block()).isNull();
+		assertThat(this.store.retrieveSession(newId).block()).isSameAs(session);
+	}
+
+	@Test // CVE-2026-41839
+	void changeSessionIdDuringSaveOfStoredSessionDoesNotRestoreOldId() throws Exception {
+		InterleavingSessionMap sessions = installInterleavingSessionMap(true);
+
+		// Session with an id known to the attacker, already in the store
+		WebSession session = insertSession();
+		String oldId = session.getId();
+
+		// Request 1 saves the session while request 2 (login) changes the session id
+		AtomicReference<CompletableFuture<Void>> changeSessionIdResult = new AtomicReference<>();
+		sessions.interleaveOnce(() -> changeSessionIdResult.set(changeSessionIdConcurrently(session)));
+		session.getAttributes().put("principal", "user");
+		session.save().block();
+
+		assertThat(changeSessionIdResult.get()).as("changeSessionId() interleaved with save()").isNotNull();
+		changeSessionIdResult.get().get(5, TimeUnit.SECONDS);
+
+		assertSessionIdChanged(session, oldId);
+	}
+
+	@Test // CVE-2026-41839
+	void changeSessionIdDuringFirstSaveDoesNotRestoreOldId() throws Exception {
+		InterleavingSessionMap sessions = installInterleavingSessionMap(false);
+
+		WebSession session = this.store.createWebSession().block();
+		assertThat(session).isNotNull();
+		session.start();
+		String oldId = session.getId();
+
+		// changeSessionId() runs while save() is about to store the session
+		AtomicReference<CompletableFuture<Void>> changeSessionIdResult = new AtomicReference<>();
+		sessions.interleaveOnce(() -> changeSessionIdResult.set(changeSessionIdConcurrently(session)));
+		session.getAttributes().put("principal", "user");
+		session.save().block();
+
+		assertThat(changeSessionIdResult.get()).as("changeSessionId() interleaved with save()").isNotNull();
+		changeSessionIdResult.get().get(5, TimeUnit.SECONDS);
+
+		assertSessionIdChanged(session, oldId);
+	}
+
+
+	private void assertSessionIdChanged(WebSession session, String oldId) {
+		String newId = session.getId();
+		assertThat(newId).isNotEqualTo(oldId);
+		assertThat(this.store.getSessions()).containsOnlyKeys(newId);
+		assertThat(this.store.retrieveSession(oldId).block()).isNull();
+		assertThat(this.store.retrieveSession(newId).block()).isSameAs(session);
+	}
+
+	private InterleavingSessionMap installInterleavingSessionMap(boolean interleaveOnRead) {
+		InterleavingSessionMap sessions = new InterleavingSessionMap(interleaveOnRead);
+		new DirectFieldAccessor(this.store).setPropertyValue("sessions", sessions);
+		return sessions;
+	}
+
+	/**
+	 * Start {@link WebSession#changeSessionId()} on another thread, and give
+	 * it the chance to complete before the calling thread resumes.
+	 */
+	private static CompletableFuture<Void> changeSessionIdConcurrently(WebSession session) {
+		CompletableFuture<Void> future = session.changeSessionId().toFuture();
+		try {
+			future.get(1, TimeUnit.SECONDS);
+		}
+		catch (TimeoutException ex) {
+			// changeSessionId() is waiting for the save() in progress
+		}
+		catch (Exception ex) {
+			throw new IllegalStateException(ex);
+		}
+		return future;
+	}
 
 	private WebSession insertSession() {
 		WebSession session = this.store.createWebSession().block();
@@ -207,6 +302,58 @@ class InMemoryWebSessionStoreTests {
 
 	private void assertNumSessions(int numSessions) {
 		assertThat(store.getSessions()).hasSize(numSessions);
+	}
+
+
+	/**
+	 * Session map that runs a given action once, on the thread that armed it,
+	 * right before the next session lookup or store operation on that thread.
+	 */
+	@SuppressWarnings("serial")
+	private static class InterleavingSessionMap extends ConcurrentHashMap<String, Object> {
+
+		private final boolean interleaveOnRead;
+
+		private volatile Thread thread;
+
+		private volatile Runnable action;
+
+		InterleavingSessionMap(boolean interleaveOnRead) {
+			this.interleaveOnRead = interleaveOnRead;
+		}
+
+		void interleaveOnce(Runnable action) {
+			this.thread = Thread.currentThread();
+			this.action = action;
+		}
+
+		@Override
+		public Object get(Object key) {
+			if (this.interleaveOnRead) {
+				interleave();
+			}
+			return super.get(key);
+		}
+
+		@Override
+		public Object put(String key, Object value) {
+			interleave();
+			return super.put(key, value);
+		}
+
+		@Override
+		public Object putIfAbsent(String key, Object value) {
+			interleave();
+			return super.putIfAbsent(key, value);
+		}
+
+		private void interleave() {
+			Runnable action = this.action;
+			if (action != null && Thread.currentThread() == this.thread) {
+				this.action = null;
+				action.run();
+			}
+		}
 	}
 
 }
